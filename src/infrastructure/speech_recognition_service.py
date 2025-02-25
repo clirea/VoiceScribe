@@ -4,6 +4,7 @@ import speech_recognition as sr
 import io
 import wave
 import numpy as np
+import os
 
 class SpeechRecognitionService:
     """
@@ -14,10 +15,13 @@ class SpeechRecognitionService:
     def __init__(self, language="ja-JP"):
         self.language = language
         self.recognizer = sr.Recognizer()
+        self.api_key = os.getenv("GOOGLE_API_KEY")
 
     def transcribe(self, audio_data: np.ndarray, sample_rate: int) -> str:
         """
         NumPy配列をWAVに変換して音声認識を行う。
+        Google Cloud Speech APIキーがある場合はそれを使用し、
+        ない場合は無料枠のGoogle Speech Recognitionを使用する。
         """
         if audio_data is None or audio_data.size == 0:
             return ""
@@ -36,7 +40,16 @@ class SpeechRecognitionService:
                 audio = self.recognizer.record(source)
 
             try:
-                text = self.recognizer.recognize_google(audio, language=self.language)
+                # Google Cloud Speech APIキーがある場合はそれを使用
+                if self.api_key:
+                    text = self.recognizer.recognize_google_cloud(
+                        audio, 
+                        language=self.language,
+                        credentials_json=self.api_key
+                    )
+                else:
+                    # 無料枠のGoogle Speech Recognition（1分間に20回までのリクエスト制限あり）
+                    text = self.recognizer.recognize_google(audio, language=self.language)
                 return text
             except sr.UnknownValueError:
                 # 音声がはっきりしない場合

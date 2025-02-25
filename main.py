@@ -36,7 +36,7 @@ def on_speech_detected(audio_data, metadata):
     """音声検出時のコールバック関数"""
     print(f"音声検出: {metadata['text']}")
 
-def main(output_file="output.txt", device_id=None, device_name=None, list_devices=False):
+def main(output_file="output.txt", device_id=None, device_name=None, list_devices=False, recognition_service="google"):
     # デバイス一覧表示モード
     if list_devices:
         AudioController.list_audio_devices()
@@ -52,7 +52,8 @@ def main(output_file="output.txt", device_id=None, device_name=None, list_device
         min_amplitude=0.01,     # これ以下の振幅はノイズ扱い
         on_speech_detected=on_speech_detected,  # コールバック関数を設定
         device=device_id,       # マイクデバイスID
-        device_name=device_name # マイクデバイス名
+        device_name=device_name, # マイクデバイス名
+        recognition_service=recognition_service  # 音声認識サービス
     )
     
     # 録音開始
@@ -74,6 +75,8 @@ if __name__ == "__main__":
     parser.add_argument('-d', '--device', type=int, help='使用するマイクデバイスのID')
     parser.add_argument('-n', '--name', type=str, help='使用するマイクデバイスの名前（部分一致）')
     parser.add_argument('-l', '--list', action='store_true', help='利用可能なマイクデバイスの一覧を表示')
+    parser.add_argument('-s', '--service', type=str, default='google', choices=['google', 'openai', 'groq'],
+                        help='使用する音声認識サービス (デフォルト: google)')
     
     args = parser.parse_args()
     
@@ -81,5 +84,6 @@ if __name__ == "__main__":
         output_file=args.output,
         device_id=args.device,
         device_name=args.name,
-        list_devices=args.list
+        list_devices=args.list,
+        recognition_service=args.service
     )

@@ -6,12 +6,14 @@ import queue
 import time
 import wave
 import io
+import os
 from datetime import datetime
 
 from src.domain.vad_service import VADService
 from src.domain.wakeword_detector import WakewordDetector
 from src.infrastructure.speech_recognition_service import SpeechRecognitionService
 from src.infrastructure.groq_recognition_service import GroqRecognitionService
+from src.infrastructure.openai_recognition_service import OpenAIRecognitionService
 
 
 class AudioController:
@@ -32,7 +34,8 @@ class AudioController:
         pre_buffer_duration=0.5,  # 音声区間開始前のバッファ保持時間（秒）
         on_speech_detected=None,  # 音声検出時のコールバック関数
         device=None,             # 使用するマイクデバイスID
-        device_name=None         # 使用するマイクデバイス名
+        device_name=None,        # 使用するマイクデバイス名
+        recognition_service="google"  # 使用する音声認識サービス（google, openai, groq）
     ):
         self.sample_rate = sample_rate
         self.channels = channels
@@ -56,10 +59,12 @@ class AudioController:
         self.is_running = False
         self.stream = None
 
-        # VAD・Wakeword・STTサービス
+        # VAD・Wakewordサービス
         self.vad_service = VADService(threshold=silence_threshold)
         self.wakeword_detector = WakewordDetector()
-        self.stt_service = GroqRecognitionService(language="ja-JP")
+        
+        # 音声認識サービスの初期化
+        self.stt_service = self._initialize_recognition_service(recognition_service)
 
         # 無音関連設定
         self.silence_duration = silence_duration
@@ -75,6 +80,26 @@ class AudioController:
 
         # コールバック
         self.on_speech_detected = on_speech_detected
+
+    def _initialize_recognition_service(self, service_name):
+        """音声認識サービスを初期化する"""
+        service_name = service_name.lower()
+        
+        if service_name == "openai" and os.getenv("OPENAI_API_KEY"):
+            print("OpenAI Whisperを使用した音声認識サービスを初期化します")
+            return OpenAIRecognitionService(language="ja-JP")
+        elif service_name == "groq" and os.getenv("GROQ_API_KEY"):
+            print("Groq APIを使用した音声認識サービスを初期化します")
+            return GroqRecognitionService(language="ja-JP")
+        else:
+            # デフォルトはGoogle Speech Recognition
+            print("Google Speech Recognitionを使用した音声認識サービスを初期化します")
+            # Google Cloud Speech APIのキーがあれば使用
+            if os.getenv("GOOGLE_API_KEY"):
+                print("Google Cloud Speech APIキーを使用します")
+            else:
+                print("Google Speech Recognition無料枠を使用します（1分間に20回までのリクエスト制限あり）")
+            return SpeechRecognitionService(language="ja-JP")
 
     def _audio_callback(self, indata, frames, time_info, status):
         if self.is_running:
