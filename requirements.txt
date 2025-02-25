@@ -1,0 +1,28 @@
+numpy
+sounddevice
+torch
+pytest
+python-dotenv
+SpeechRecognition
+groq
+argparse
+
+# torch dependencies
+filelock
+fsspec
+jinja2
+networkx
+setuptools
+sympy
+typing-extensions
+
+# groq dependencies
+anyio
+distro
+httpx
+pydantic
+sniffio
+
+# Silero VAD dependencies
+torchaudio
+omegaconf 
