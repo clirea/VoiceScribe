@@ -1,19 +1,34 @@
 # infrastructure/openai_recognition_service.py
 
-import os
-import io
-import wave
 import numpy as np
-from openai import OpenAI
+
+from src.domain.errors import ConfigurationError
+from src.infrastructure.wav_encoder import encode_wav
+from src.infrastructure.whisper_api_support import to_recognition_error, to_whisper_language
+
+DEFAULT_MODEL = "whisper-1"
+
 
 class OpenAIRecognitionService:
     """
     OpenAI APIを使って音声をテキストに変換するクラス。
-    Whisperモデルを利用するわ。
+    既定ではWhisperモデルを利用するわ。
     """
 
-    def __init__(self, language="ja-JP"):
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    def __init__(self, api_key=None, language=None, model=None, client=None, timeout=30.0):
+        self.language = to_whisper_language(language)
+        self.model = model or DEFAULT_MODEL
+        self.client = client if client is not None else self._create_client(api_key, timeout)
+
+    @staticmethod
+    def _create_client(api_key, timeout):
+        try:
+            from openai import OpenAI
+        except ImportError as e:
+            raise ConfigurationError(
+                "openai を読み込めません。`pip install -r requirements.txt` を実行してください。"
+            ) from e
+        return OpenAI(api_key=api_key, timeout=timeout)
 
     def transcribe(self, audio_data: np.ndarray, sample_rate: int) -> str:
         """
@@ -22,22 +37,16 @@ class OpenAIRecognitionService:
         if audio_data is None or audio_data.size == 0:
             return ""
 
-        # NumPy配列 → WAVバイナリに変換
-        with io.BytesIO() as wav_buffer:
-            with wave.open(wav_buffer, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)  # 16bit
-                wf.setframerate(sample_rate)
-                wf.writeframes((audio_data * 32767).astype('int16').tobytes())
+        request = {
+            "file": ("audio.wav", encode_wav(audio_data, sample_rate), "audio/wav"),
+            "model": self.model,
+        }
+        # 言語を指定しない場合はAPI側の自動判定に任せる
+        if self.language:
+            request["language"] = self.language
 
-            try:
-                # バッファを巻き戻してOpenAI APIに送信
-                wav_buffer.seek(0)
-                transcription = self.client.audio.transcriptions.create(
-                    file=("audio.wav", wav_buffer.read()),
-                    model="whisper-1"
-                )
-                return transcription.text
-            except Exception as e:
-                print(f"OpenAIRecognitionService: 予期せぬエラーが発生したわ: {e}")
-                return ""
+        try:
+            transcription = self.client.audio.transcriptions.create(**request)
+        except Exception as e:
+            raise to_recognition_error("OpenAI", e) from e
+        return transcription.text or ""

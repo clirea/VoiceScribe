@@ -1,28 +1,14 @@
-numpy
-sounddevice
-torch
-pytest
-python-dotenv
-SpeechRecognition
-groq
-argparse
+# 実行に必要なライブラリ（Python 3.10以上）
+# 下限は 2026-10 時点で動作を確認した版、上限は互換性の無い変更が入りうる次のメジャー版。
+numpy>=2.0,<3
+sounddevice>=0.5.6,<0.6
+python-dotenv>=1.2,<2
 
-# torch dependencies
-filelock
-fsspec
-jinja2
-networkx
-setuptools
-sympy
-typing-extensions
+# 音声活動検出（Silero VAD。モデルはパッケージに同梱され、torch上で動く）
+torch>=2.14,<3
+silero-vad>=6.2,<7
 
-# groq dependencies
-anyio
-distro
-httpx
-pydantic
-sniffio
-
-# Silero VAD dependencies
-torchaudio
-omegaconf 
+# 音声認識サービス
+SpeechRecognition>=3.17,<4
+openai>=3.29,<4
+groq>=1.7,<2

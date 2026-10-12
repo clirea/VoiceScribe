@@ -1,0 +1,18 @@
+# ツール設定のみ（このリポジトリはパッケージとして配布しない）
+
+[tool.pytest.ini_options]
+testpaths = ["src/tests"]
+pythonpath = ["."]
+addopts = "--import-mode=importlib"
+filterwarnings = [
+    # SpeechRecognition が Python 3.12 で標準ライブラリの aifc / audioop を読み込むことによる警告
+    "ignore:'aifc' is deprecated:DeprecationWarning",
+    "ignore:'audioop' is deprecated:DeprecationWarning",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]

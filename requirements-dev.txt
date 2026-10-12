@@ -1,0 +1,5 @@
+# 開発・検証用（テストとlint）
+-r requirements.txt
+-r requirements-google-cloud.txt
+pytest>=9.1,<10
+ruff>=0.17,<0.18
