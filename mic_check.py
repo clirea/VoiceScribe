@@ -101,6 +101,10 @@ def run_menu(audio_input, read_input=input):
 
 def main():
     """メイン関数"""
+    # 日本語を表せないコンソールでも、最初の案内やデバイス名の表示で停止しない
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     print("マイクチェックツール")
     print("=" * 50)
 

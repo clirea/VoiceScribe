@@ -1,6 +1,9 @@
 # tests/test_main.py
 
 import logging
+import os
+import subprocess
+import sys
 import wave
 from unittest.mock import MagicMock, patch
 
@@ -135,6 +138,70 @@ def test異常系_mainメソッドが不正な最大区間長を設定エラー�
 def test異常系_mainメソッドが実行時エラーで終了コード1を返すこと(main_dependencies):
     main_dependencies["run"].side_effect = AudioInputError("マイク入力が停止しました")
     assert app.main([]) == 1
+
+
+def test正常系_mainメソッドが引数解析より先にコンソールを構成すること():
+    calls = []
+    args = parse()
+    parser = MagicMock()
+    parser.parse_args.side_effect = lambda argv: calls.append("parse_args") or args
+    with (
+        patch.object(app, "run"),
+        patch.object(app, "configure_console", side_effect=lambda: calls.append("configure_console")),
+        patch.object(app, "build_parser", return_value=parser),
+        patch("dotenv.load_dotenv"),
+    ):
+        app.main([])
+    assert calls == ["configure_console", "parse_args"]
+
+
+def run_cli_in_cp1252_console(*argv):
+    """日本語を表せない文字コードのコンソール（英語版Windowsの既定）で main.py を子プロセスとして実行する"""
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252:strict"}
+    env.pop("PYTHONUTF8", None)
+    return subprocess.run(
+        [sys.executable, app.__file__, *argv],
+        env=env,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+
+
+@pytest.fixture(scope="module")
+def cp1252_help_result():
+    return run_cli_in_cp1252_console("--help")
+
+
+@pytest.fixture(scope="module")
+def cp1252_invalid_argument_result():
+    return run_cli_in_cp1252_console("--no-such-option")
+
+
+def test正常系_mainメソッドが日本語を表せないコンソールでもhelpを終了コード0で表示すること(cp1252_help_result):
+    assert cp1252_help_result.returncode == 0
+
+
+def test正常系_mainメソッドが日本語を表せないコンソールでもhelpに使い方を出力すること(cp1252_help_result):
+    assert cp1252_help_result.stdout.decode("cp1252").startswith("usage: main.py")
+
+
+def test正常系_mainメソッドが日本語を表せないコンソールでもhelpに全オプションを出力すること(cp1252_help_result):
+    assert "--save-failed-audio DIR" in cp1252_help_result.stdout.decode("cp1252")
+
+
+def test正常系_mainメソッドが日本語を表せないコンソールでもhelpでエラーを出力しないこと(cp1252_help_result):
+    assert cp1252_help_result.stderr == b""
+
+
+def test異常系_mainメソッドが日本語を表せないコンソールでも不正な引数で終了コード2を返すこと(
+    cp1252_invalid_argument_result,
+):
+    assert cp1252_invalid_argument_result.returncode == 2
+
+
+def test異常系_mainメソッドが日本語を表せないコンソールでも不正な引数を知らせること(cp1252_invalid_argument_result):
+    assert "unrecognized arguments: --no-such-option" in cp1252_invalid_argument_result.stderr.decode("cp1252")
 
 
 # --- run ---

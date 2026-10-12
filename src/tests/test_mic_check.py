@@ -1,5 +1,6 @@
 # tests/test_mic_check.py
 
+import io
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -192,3 +193,27 @@ def test正常系_mainメソッドがCtrl_Cで0を返すこと(main_dependencies
 def test異常系_mainメソッドがオーディオ機能を使えないとき1を返すこと(main_dependencies):
     main_dependencies["audio_input_class"].side_effect = ConfigurationError("PortAudioがありません")
     assert mic_check.main() == 1
+
+
+@pytest.fixture
+def cp1252_console():
+    buffer = io.BytesIO()
+    with io.TextIOWrapper(buffer, encoding="cp1252", errors="strict") as console:
+        yield console
+
+
+def test正常系_mainメソッドが日本語を表せないコンソールでもマイク一覧を表示して終了すること(
+    main_dependencies, cp1252_console
+):
+    with patch.object(mic_check.sys, "stdout", cp1252_console):
+        result = mic_check.main()
+    assert result == 0
+
+
+def test異常系_mainメソッドが日本語を表せないコンソールでも入力機器エラーを終了コード1にすること(
+    main_dependencies, cp1252_console
+):
+    main_dependencies["audio_input_class"].side_effect = AudioInputError("マイクを開けません")
+    with patch.object(mic_check.sys, "stdout", cp1252_console):
+        result = mic_check.main()
+    assert result == 1

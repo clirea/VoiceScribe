@@ -184,8 +184,9 @@ def run(args, env=None):
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    # --help や引数エラーの表示にも効くよう、引数解析より先に構成する
     configure_console()
+    args = build_parser().parse_args(argv)
 
     # .envファイルを読み込む
     from dotenv import load_dotenv
