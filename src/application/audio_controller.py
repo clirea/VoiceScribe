@@ -1,269 +1,256 @@
 # application/audio_controller.py
 
-import numpy as np
-import sounddevice as sd
+import logging
 import queue
 import time
-import wave
-import io
-import os
 from datetime import datetime
 
-from src.domain.vad_service import VADService
+import numpy as np
+
+from src.domain.errors import AudioInputError, ConfigurationError, RecognitionError
+from src.domain.speech_segmenter import SpeechSegmenter
 from src.domain.wakeword_detector import WakewordDetector
-from src.infrastructure.speech_recognition_service import SpeechRecognitionService
-from src.infrastructure.groq_recognition_service import GroqRecognitionService
-from src.infrastructure.openai_recognition_service import OpenAIRecognitionService
+
+logger = logging.getLogger(__name__)
 
 
 class AudioController:
     """
     常時録音してVADで音声を判定し、無音が続いたタイミングで録音を切り出す。
-    speech_recognitionでテキスト化し、ウェイクワードを検知したら音声データを返す。
+    音声認識サービスでテキスト化し、音声データとメタデータを返す。
+
+    VAD・音声認識・マイク入力は外から受け取り、このクラスは流れの制御だけを担う。
     """
+
+    QUEUE_POLL_SECONDS = 0.1
+    PROBLEM_REPORT_INTERVAL_SECONDS = 5.0
 
     def __init__(
         self,
+        vad_service,
+        stt_service,
+        audio_input,
+        wakeword_detector=None,
         sample_rate=16000,
-        channels=1,
-        dtype=np.float32,
         block_size=512,
-        silence_threshold=0.7,   # VADの閾値
-        silence_duration=1.0,    # 無音判定に必要な継続秒数
-        min_amplitude=0.01,      # ノイズ判定用の最低振幅
-        pre_buffer_duration=0.5,  # 音声区間開始前のバッファ保持時間（秒）
-        on_speech_detected=None,  # 音声検出時のコールバック関数
-        device=None,             # 使用するマイクデバイスID
-        device_name=None,        # 使用するマイクデバイス名
-        recognition_service="google"  # 使用する音声認識サービス（google, openai, groq）
+        silence_duration=1.0,      # 無音判定に必要な継続秒数
+        min_amplitude=0.0,         # 最大振幅がこれ未満の区間は認識に送らない（0で無効）
+        pre_buffer_duration=0.5,   # 音声区間開始前のバッファ保持時間（秒）
+        max_speech_duration=30.0,  # 1区間の最大秒数（0以下で無制限）
+        max_queue_seconds=60.0,    # 認識待ちの間に溜めておける音声の上限（秒）
+        on_speech_detected=None,   # 音声検出時のコールバック関数
+        on_recognition_error=None,  # 認識失敗時のコールバック関数
+        device=None,               # 使用するマイクデバイスID
     ):
+        required_block_size = vad_service.required_chunk_size(sample_rate)
+        if block_size != required_block_size:
+            raise ConfigurationError(
+                f"{sample_rate}Hz ではブロックサイズを {required_block_size} にする必要があります"
+                f"（指定値: {block_size}）。"
+            )
+
         self.sample_rate = sample_rate
-        self.channels = channels
-        self.dtype = dtype
+        self.channels = 1
         self.block_size = block_size
-
-        # マイクデバイス設定
         self.device = device
-        # デバイス名が指定された場合、IDを検索
-        if device_name is not None:
-            devices = sd.query_devices()
-            for i, dev in enumerate(devices):
-                if device_name.lower() in dev['name'].lower() and dev['max_input_channels'] > 0:
-                    self.device = i
-                    print(f"マイク '{device_name}' を見つけました (ID: {i})")
-                    break
-            else:
-                print(f"警告: '{device_name}'という名前のマイクが見つかりませんでした。デフォルトマイクを使用します。")
 
-        self.audio_queue = queue.Queue()
+        self.vad_service = vad_service
+        self.stt_service = stt_service
+        self.audio_input = audio_input
+        self.wakeword_detector = wakeword_detector if wakeword_detector is not None else WakewordDetector()
+        self.segmenter = SpeechSegmenter(
+            sample_rate=sample_rate,
+            silence_duration=silence_duration,
+            pre_buffer_duration=pre_buffer_duration,
+            max_speech_duration=max_speech_duration,
+        )
+        self.min_amplitude = min_amplitude
+
+        max_queued_blocks = max(1, int(max_queue_seconds * sample_rate / block_size))
+        self.audio_queue = queue.Queue(maxsize=max_queued_blocks)
         self.is_running = False
         self.stream = None
 
-        # VAD・Wakewordサービス
-        self.vad_service = VADService(threshold=silence_threshold)
-        self.wakeword_detector = WakewordDetector()
-        
-        # 音声認識サービスの初期化
-        self.stt_service = self._initialize_recognition_service(recognition_service)
-
-        # 無音関連設定
-        self.silence_duration = silence_duration
-        self.min_amplitude = min_amplitude
-
-        # 音声バッファ関連
-        self.speech_buffer = []  # 音声区間のバッファ
-        self.is_speech_active = False  # 現在音声区間かどうか
-        
-        # プリバッファ関連
-        self.pre_buffer_size = int(pre_buffer_duration * sample_rate)
-        self.pre_buffer = []
+        # コールバックスレッドで数え、メインループ側で報告する
+        self._dropped_chunks = 0
+        self._input_overflows = 0
+        self._last_problem_report = float("-inf")
+        # 認識の途中で割り込まれた区間。flush() でもう一度だけ認識する
+        self._interrupted_segment = None
 
         # コールバック
         self.on_speech_detected = on_speech_detected
-
-    def _initialize_recognition_service(self, service_name):
-        """音声認識サービスを初期化する"""
-        service_name = service_name.lower()
-        
-        if service_name == "openai" and os.getenv("OPENAI_API_KEY"):
-            print("OpenAI Whisperを使用した音声認識サービスを初期化します")
-            return OpenAIRecognitionService(language="ja-JP")
-        elif service_name == "groq" and os.getenv("GROQ_API_KEY"):
-            print("Groq APIを使用した音声認識サービスを初期化します")
-            return GroqRecognitionService(language="ja-JP")
-        else:
-            # デフォルトはGoogle Speech Recognition
-            print("Google Speech Recognitionを使用した音声認識サービスを初期化します")
-            # Google Cloud Speech APIのキーがあれば使用
-            if os.getenv("GOOGLE_API_KEY"):
-                print("Google Cloud Speech APIキーを使用します")
-            else:
-                print("Google Speech Recognition無料枠を使用します（1分間に20回までのリクエスト制限あり）")
-            return SpeechRecognitionService(language="ja-JP")
+        self.on_recognition_error = on_recognition_error
 
     def _audio_callback(self, indata, frames, time_info, status):
-        if self.is_running:
-            self.audio_queue.put(indata.copy())
+        if not self.is_running:
+            return
+        if status and getattr(status, "input_overflow", False):
+            self._input_overflows += 1
+        try:
+            self.audio_queue.put_nowait(indata[:, 0].copy())
+        except queue.Full:
+            self._dropped_chunks += 1
 
     def start_listening(self):
         """音声入力ストリームを開始する"""
-        print("AudioController: 録音開始")
+        if self.stream is not None:
+            return
+        logger.info("AudioController: 録音開始（%s）", self.audio_input.describe_device(self.device))
+        self.vad_service.reset()
         self.is_running = True
-        
-        # 使用するデバイスの情報を表示
-        if self.device is not None:
-            try:
-                device_info = sd.query_devices(self.device)
-                print(f"使用マイク: {device_info['name']} (ID: {self.device})")
-            except Exception as e:
-                print(f"マイク情報取得エラー: {e}")
-                print("デフォルトマイクを使用します。")
-                self.device = None
-        else:
-            print("デフォルトマイクを使用します。")
-        
-        self.stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype=self.dtype,
-            blocksize=self.block_size,
-            callback=self._audio_callback,
-            device=self.device
-        )
-        self.stream.start()
+        try:
+            self.stream = self.audio_input.open_stream(
+                sample_rate=self.sample_rate,
+                block_size=self.block_size,
+                device=self.device,
+                callback=self._audio_callback,
+            )
+        except Exception:
+            self.is_running = False
+            raise
 
     def stop_listening(self):
-        """音声入力ストリームを停止する"""
-        print("AudioController: 録音停止")
+        """音声入力ストリームを停止する（何度呼んでもよい）"""
         self.is_running = False
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
-
-    def save_to_wav(self, audio_data: np.ndarray, filename: str):
-        """NumPyの音声配列をWAVファイルに保存する"""
-        if audio_data is None or audio_data.size == 0:
+        stream, self.stream = self.stream, None
+        if stream is None:
             return
-        with wave.open(filename, 'wb') as wf:
-            wf.setnchannels(self.channels)
-            wf.setsampwidth(2)
-            wf.setframerate(self.sample_rate)
-            wf.writeframes((audio_data * 32767).astype('int16').tobytes())
-        print(f"AudioController: 音声ファイル保存完了 -> {filename}")
+        logger.info("AudioController: 録音停止")
+        try:
+            stream.stop()
+        except Exception as e:
+            logger.warning("AudioController: ストリーム停止時にエラー %s", e)
+        finally:
+            stream.close()
 
-    def update_pre_buffer(self, chunk: np.ndarray):
-        """プリバッファを更新する"""
-        self.pre_buffer.append(chunk)
-        # プリバッファのサイズを制限
-        total_samples = sum(len(c) for c in self.pre_buffer)
-        while total_samples > self.pre_buffer_size:
-            removed = self.pre_buffer.pop(0)
-            total_samples -= len(removed)
+    def process_speech_segment(self, audio_data: np.ndarray):
+        """音声区間を認識して (音声データ, メタデータ) を返す。出力するものが無ければNoneを返す。"""
+        if audio_data is None or audio_data.size == 0:
+            return None
 
-    def process_speech_segment(self):
-        """音声区間を処理して音声データとメタデータを返す"""
-        if not self.speech_buffer:
-            return None, None
+        if float(np.max(np.abs(audio_data))) < self.min_amplitude:
+            logger.info("AudioController: 振幅が小さいためノイズとして破棄")
+            return None
 
-        # プリバッファと音声バッファを結合
-        audio_data = np.concatenate(self.pre_buffer + self.speech_buffer)
-        
-        # 音声認識実行
-        recognized_text = self.stt_service.transcribe(audio_data, self.sample_rate)
-        is_wake = self.wakeword_detector.detect(recognized_text)
+        # 音声認識実行（Ctrl+Cなどで中断された場合に備えて、終わるまで区間を控えておく）
+        self._interrupted_segment = audio_data
+        try:
+            recognized_text = self.stt_service.transcribe(audio_data, self.sample_rate)
+        except RecognitionError as e:
+            self._interrupted_segment = None
+            if self.on_recognition_error:
+                self.on_recognition_error(audio_data, e)
+            if e.fatal:
+                raise
+            logger.error("AudioController: この発話は記録されません。%s", e)
+            return None
+        self._interrupted_segment = None
+
+        if not recognized_text or not recognized_text.strip():
+            return None
 
         # メタデータ作成
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         metadata = {
-            "timestamp": timestamp,
-            "is_wake_word": is_wake,
+            "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+            "is_wake_word": self.wakeword_detector.detect(recognized_text),
             "text": recognized_text,
             "sample_rate": self.sample_rate,
-            "channels": self.channels
+            "channels": self.channels,
         }
-        
+
         # コールバック実行
         if self.on_speech_detected:
             self.on_speech_detected(audio_data, metadata)
-        
-        # バッファクリア
-        self.speech_buffer = []
-        
+
         return audio_data, metadata
 
     def run_forever(self):
-        """常時ループで音声を取り続け、音声区間のみを返す"""
-        silence_counter = 0.0
-        print("AudioController: ループ開始。Ctrl+Cで終了してちょうだい。")
+        """常時ループで音声を取り続け、認識できた音声区間の (音声データ, メタデータ) を順に返す"""
+        logger.info("AudioController: ループ開始。Ctrl+Cで終了します。")
 
         while self.is_running:
             try:
-                if not self.audio_queue.empty():
-                    chunk = self.audio_queue.get()
-                    flattened_chunk = chunk.flatten()
+                chunk = self.audio_queue.get(timeout=self.QUEUE_POLL_SECONDS)
+            except queue.Empty:
+                self._ensure_stream_is_active()
+                continue
 
-                    # VADで音声判定
-                    is_speech = self.vad_service.is_speech(flattened_chunk, self.sample_rate)
+            self._report_input_problems()
+            result = self._consume(chunk)
+            if result is not None:
+                yield result
 
-                    if is_speech:
-                        # 音声区間
-                        silence_counter = 0
-                        if not self.is_speech_active:
-                            # 音声区間開始
-                            self.is_speech_active = True
-                            print("AudioController: 音声区間開始")
-                        self.speech_buffer.append(flattened_chunk)
-                    else:
-                        # 無音区間
-                        silence_counter += len(flattened_chunk) / self.sample_rate
-                        # 音声区間外ならプリバッファを更新
-                        if not self.is_speech_active:
-                            self.update_pre_buffer(flattened_chunk)
+        logger.info("AudioController: run_forever終了")
 
-                        if silence_counter >= self.silence_duration and self.is_speech_active:
-                            # 十分な無音期間で音声区間終了
-                            self.is_speech_active = False
-                            print("AudioController: 音声区間終了")
-                            yield self.process_speech_segment()
-                            silence_counter = 0
-                            # プリバッファをクリアして再開
-                            self.pre_buffer = []
+    def flush(self):
+        """
+        終了時に、認識を中断された区間・キューに残った音声・切り出し途中の発話を処理し、結果を順に返す。
 
-                else:
-                    time.sleep(0.01)
+        1件ずつ返すため、後の区間で失敗しても、それまでの結果は呼び出し元へ渡っている。
+        中断された区間の再認識は1回だけで、再び中断された場合は呼び出し元が打ち切る。
+        """
+        interrupted_segment, self._interrupted_segment = self._interrupted_segment, None
+        result = self.process_speech_segment(interrupted_segment)
+        if result is not None:
+            yield result
 
-            except KeyboardInterrupt:
-                print("AudioController: Ctrl+Cを検知。停止するわ。")
-                if self.is_speech_active:
-                    # 終了時に処理中の音声があれば返す
-                    yield self.process_speech_segment()
+        while True:
+            try:
+                chunk = self.audio_queue.get_nowait()
+            except queue.Empty:
                 break
-            except Exception as e:
-                print(f"AudioController: ループ中にエラー発生 {e}")
-                if self.is_speech_active:
-                    # エラー時に処理中の音声があれば返す
-                    yield self.process_speech_segment()
+            result = self._consume(chunk)
+            if result is not None:
+                yield result
 
-        print("AudioController: run_forever終了")
+        result = self.process_speech_segment(self.segmenter.flush())
+        if result is not None:
+            yield result
 
-    @staticmethod
-    def list_audio_devices():
-        """利用可能なオーディオデバイスの一覧を表示する"""
-        print("利用可能なオーディオデバイス一覧:")
-        print("-" * 70)
-        devices = sd.query_devices()
-        
-        input_devices = []
-        
-        for i, device in enumerate(devices):
-            if device['max_input_channels'] > 0:  # 入力デバイス（マイク）のみ表示
-                mark = '* ' if device.get('default_input') else '  '
-                print(f"{mark}{i}: {device['name']} (入力チャンネル: {device['max_input_channels']})")
-                input_devices.append((i, device['name']))
-                
-        print("-" * 70)
-        print("* がデフォルトの入力デバイス")
-        
-        return input_devices
+    def unprocessed_seconds(self) -> float:
+        """認識に送れていない音声（中断された区間・キュー・切り出し途中）のおおよその秒数を返す。"""
+        samples = self.audio_queue.qsize() * self.block_size + self.segmenter.buffered_samples
+        if self._interrupted_segment is not None:
+            samples += len(self._interrupted_segment)
+        return samples / self.sample_rate
 
+    def _consume(self, chunk):
+        """チャンクを1つVADと区間切り出しに通し、区間が確定したら認識結果を返す。"""
+        mono_chunk = np.asarray(chunk).reshape(-1)
+        was_active = self.segmenter.is_speech_active
+
+        # VADで音声判定
+        is_speech = self.vad_service.is_speech(mono_chunk, self.sample_rate)
+        segment = self.segmenter.feed(mono_chunk, is_speech)
+
+        if is_speech and not was_active:
+            logger.info("AudioController: 音声区間開始")
+        if segment is None:
+            return None
+        logger.info("AudioController: 音声区間終了")
+        return self.process_speech_segment(segment)
+
+    def _ensure_stream_is_active(self):
+        """音声が届かないとき、マイクが切断されていないか確かめる。"""
+        if self.stream is not None and not self.stream.active:
+            raise AudioInputError(
+                "マイク入力が停止しました。マイクの接続を確認して再実行してください。"
+            )
+
+    def _report_input_problems(self):
+        """取りこぼした音声があれば、一定間隔で警告する。"""
+        if not (self._dropped_chunks or self._input_overflows):
+            return
+        now = time.monotonic()
+        if now - self._last_problem_report < self.PROBLEM_REPORT_INTERVAL_SECONDS:
+            return
+        dropped_seconds = self._dropped_chunks * self.block_size / self.sample_rate
+        logger.warning(
+            "AudioController: 音声を取りこぼしました（キュー溢れ: 約%.1f秒, 入力オーバーフロー: %d回）",
+            dropped_seconds,
+            self._input_overflows,
+        )
+        self._dropped_chunks = 0
+        self._input_overflows = 0
+        self._last_problem_report = now

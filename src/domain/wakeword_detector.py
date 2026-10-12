@@ -1,5 +1,6 @@
 # domain/wakeword_detector.py
 
+
 class WakewordDetector:
     """
     ウェイクワード（例：アウラ）が含まれるかどうかを
@@ -16,7 +17,5 @@ class WakewordDetector:
         """
         if not recognized_text:
             return False
-        for w in self.wakewords:
-            if w.lower() in recognized_text.lower():
-                return True
-        return False
+        lowered_text = recognized_text.lower()
+        return any(w.lower() in lowered_text for w in self.wakewords)

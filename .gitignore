@@ -1,6 +1,10 @@
 # 環境変数ファイル
 .env
 
+# 実行時に生成されるファイル
+output.txt
+mic_test_*.wav
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
